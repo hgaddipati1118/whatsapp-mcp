@@ -46,6 +46,44 @@ type MessageStore struct {
 	db *sql.DB
 }
 
+type nativeReplyContext struct {
+	MessageID string
+	Sender    string
+	Text      string
+	ChatJID   string
+}
+
+func ensureMessageReplySchema(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(messages)")
+	if err != nil {
+		return err
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, primaryKey int
+		var defaultValue interface{}
+		if err = rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, column := range []string{"reply_to_message_id", "reply_to_sender", "reply_to_text"} {
+		if columns[column] {
+			continue
+		}
+		if _, err = db.Exec("ALTER TABLE messages ADD COLUMN " + column + " TEXT"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
@@ -89,6 +127,10 @@ func NewMessageStore() (*MessageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
+	if err = ensureMessageReplySchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate message reply schema: %v", err)
+	}
 
 	return &MessageStore{db: db}, nil
 }
@@ -109,7 +151,8 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	reply nativeReplyContext) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -117,9 +160,11 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key,
+		 file_sha256, file_enc_sha256, file_length, reply_to_message_id, reply_to_sender, reply_to_text)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		reply.MessageID, reply.Sender, reply.Text,
 	)
 	return err
 }
@@ -189,6 +234,87 @@ func extractTextContent(msg *waProto.Message) string {
 	return ""
 }
 
+func messageContextInfo(msg *waProto.Message) *waProto.ContextInfo {
+	if msg == nil {
+		return nil
+	}
+	if value := msg.GetExtendedTextMessage(); value != nil {
+		return value.GetContextInfo()
+	}
+	if value := msg.GetImageMessage(); value != nil {
+		return value.GetContextInfo()
+	}
+	if value := msg.GetVideoMessage(); value != nil {
+		return value.GetContextInfo()
+	}
+	if value := msg.GetAudioMessage(); value != nil {
+		return value.GetContextInfo()
+	}
+	if value := msg.GetDocumentMessage(); value != nil {
+		return value.GetContextInfo()
+	}
+	return nil
+}
+
+func extractReplyContext(msg *waProto.Message) nativeReplyContext {
+	contextInfo := messageContextInfo(msg)
+	if contextInfo == nil || contextInfo.GetStanzaID() == "" {
+		return nativeReplyContext{}
+	}
+	quoted := contextInfo.GetQuotedMessage()
+	return nativeReplyContext{
+		MessageID: contextInfo.GetStanzaID(),
+		Sender:    contextInfo.GetParticipant(),
+		Text:      extractTextContent(quoted),
+	}
+}
+
+func applyReplyContext(msg *waProto.Message, reply nativeReplyContext) {
+	if msg == nil || reply.MessageID == "" {
+		return
+	}
+	contextInfo := &waProto.ContextInfo{
+		StanzaID: proto.String(reply.MessageID),
+		QuotedMessage: &waProto.Message{
+			Conversation: proto.String(reply.Text),
+		},
+	}
+	if reply.Sender != "" {
+		contextInfo.Participant = proto.String(reply.Sender)
+	}
+	if reply.ChatJID != "" {
+		contextInfo.RemoteJID = proto.String(reply.ChatJID)
+	}
+	if msg.GetConversation() != "" {
+		text := msg.GetConversation()
+		msg.Conversation = nil
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+			Text:        proto.String(text),
+			ContextInfo: contextInfo,
+		}
+		return
+	}
+	if value := msg.GetExtendedTextMessage(); value != nil {
+		value.ContextInfo = contextInfo
+		return
+	}
+	if value := msg.GetImageMessage(); value != nil {
+		value.ContextInfo = contextInfo
+		return
+	}
+	if value := msg.GetVideoMessage(); value != nil {
+		value.ContextInfo = contextInfo
+		return
+	}
+	if value := msg.GetAudioMessage(); value != nil {
+		value.ContextInfo = contextInfo
+		return
+	}
+	if value := msg.GetDocumentMessage(); value != nil {
+		value.ContextInfo = contextInfo
+	}
+}
+
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
@@ -197,13 +323,16 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient        string `json:"recipient"`
+	Message          string `json:"message"`
+	MediaPath        string `json:"media_path,omitempty"`
+	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	ReplyToSender    string `json:"reply_to_sender,omitempty"`
+	ReplyToText      string `json:"reply_to_text,omitempty"`
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string, reply nativeReplyContext) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -360,6 +489,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	} else {
 		msg.Conversation = proto.String(message)
 	}
+	applyReplyContext(msg, reply)
 
 	// Send message
 	_, err = client.SendMessage(context.Background(), recipientJID, msg)
@@ -412,7 +542,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	sender := msg.Info.Sender.String()
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -428,6 +558,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	reply := extractReplyContext(msg.Message)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -449,6 +580,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		reply,
 	)
 
 	if err != nil {
@@ -677,6 +809,17 @@ func extractDirectPathFromURL(url string) string {
 
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	http.HandleFunc("/api/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{
+			"native_replies": true,
+		})
+	})
+
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -706,7 +849,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(
+			client,
+			req.Recipient,
+			req.Message,
+			req.MediaPath,
+			nativeReplyContext{
+				MessageID: req.ReplyToMessageID,
+				Sender:    req.ReplyToSender,
+				Text:      req.ReplyToText,
+				ChatJID:   req.Recipient,
+			},
+		)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1071,6 +1225,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				if msg.Message.Message != nil {
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
+				reply := extractReplyContext(msg.Message.Message)
 
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
@@ -1090,12 +1245,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
 						sender = *msg.Message.Key.Participant
 					} else if isFromMe {
-						sender = client.Store.ID.User
+						sender = client.Store.ID.String()
 					} else {
-						sender = jid.User
+						sender = jid.String()
 					}
 				} else {
-					sender = jid.User
+					sender = jid.String()
 				}
 
 				// Store message
@@ -1126,6 +1281,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					reply,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
