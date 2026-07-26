@@ -53,6 +53,21 @@ type nativeReplyContext struct {
 	ChatJID   string
 }
 
+type storedReaction struct {
+	Actor    string `json:"actor"`
+	Emoji    string `json:"emoji"`
+	IsFromMe bool   `json:"is_from_me"`
+}
+
+type messageMutationTarget struct {
+	ID        string
+	ChatJID   string
+	Sender    string
+	Content   string
+	Timestamp time.Time
+	IsFromMe  bool
+}
+
 func ensureMessageReplySchema(db *sql.DB) error {
 	rows, err := db.Query("PRAGMA table_info(messages)")
 	if err != nil {
@@ -73,7 +88,13 @@ func ensureMessageReplySchema(db *sql.DB) error {
 	if err = rows.Close(); err != nil {
 		return err
 	}
-	for _, column := range []string{"reply_to_message_id", "reply_to_sender", "reply_to_text"} {
+	for _, column := range []string{
+		"reply_to_message_id",
+		"reply_to_sender",
+		"reply_to_text",
+		"reactions_json",
+		"edited_at",
+	} {
 		if columns[column] {
 			continue
 		}
@@ -119,6 +140,11 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			reply_to_message_id TEXT,
+			reply_to_sender TEXT,
+			reply_to_text TEXT,
+			reactions_json TEXT,
+			edited_at TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -159,14 +185,150 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
+		`INSERT INTO messages
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key,
 		 file_sha256, file_enc_sha256, file_length, reply_to_message_id, reply_to_sender, reply_to_text)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			sender = excluded.sender,
+			content = excluded.content,
+			timestamp = excluded.timestamp,
+			is_from_me = excluded.is_from_me,
+			media_type = excluded.media_type,
+			filename = excluded.filename,
+			url = excluded.url,
+			media_key = excluded.media_key,
+			file_sha256 = excluded.file_sha256,
+			file_enc_sha256 = excluded.file_enc_sha256,
+			file_length = excluded.file_length,
+			reply_to_message_id = excluded.reply_to_message_id,
+			reply_to_sender = excluded.reply_to_sender,
+			reply_to_text = excluded.reply_to_text`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 		reply.MessageID, reply.Sender, reply.Text,
 	)
 	return err
+}
+
+func (store *MessageStore) GetMessageMutationTarget(chatJID, messageID string, requireOwn bool) (messageMutationTarget, error) {
+	var target messageMutationTarget
+	err := store.db.QueryRow(
+		`SELECT id, chat_jid, sender, content, timestamp, is_from_me
+		 FROM messages
+		 WHERE chat_jid = ? AND id = ?
+		 LIMIT 1`,
+		chatJID,
+		messageID,
+	).Scan(
+		&target.ID,
+		&target.ChatJID,
+		&target.Sender,
+		&target.Content,
+		&target.Timestamp,
+		&target.IsFromMe,
+	)
+	if err != nil {
+		return messageMutationTarget{}, err
+	}
+	if requireOwn && !target.IsFromMe {
+		return messageMutationTarget{}, fmt.Errorf("message is not owned by the connected account")
+	}
+	return target, nil
+}
+
+func (store *MessageStore) SetMessageReaction(
+	chatJID,
+	messageID,
+	actor,
+	emoji string,
+	isFromMe bool,
+) error {
+	if isFromMe {
+		actor = "me"
+	}
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		return fmt.Errorf("reaction actor is required")
+	}
+	tx, err := store.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var encoded sql.NullString
+	if err = tx.QueryRow(
+		"SELECT reactions_json FROM messages WHERE chat_jid = ? AND id = ? LIMIT 1",
+		chatJID,
+		messageID,
+	).Scan(&encoded); err != nil {
+		return err
+	}
+	reactions := []storedReaction{}
+	if encoded.Valid && strings.TrimSpace(encoded.String) != "" {
+		if err = json.Unmarshal([]byte(encoded.String), &reactions); err != nil {
+			reactions = []storedReaction{}
+		}
+	}
+	next := make([]storedReaction, 0, len(reactions)+1)
+	for _, reaction := range reactions {
+		if reaction.Actor != actor {
+			next = append(next, reaction)
+		}
+	}
+	if strings.TrimSpace(emoji) != "" {
+		next = append(next, storedReaction{
+			Actor:    actor,
+			Emoji:    strings.TrimSpace(emoji),
+			IsFromMe: isFromMe,
+		})
+	}
+	payload, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(
+		"UPDATE messages SET reactions_json = ? WHERE chat_jid = ? AND id = ?",
+		string(payload),
+		chatJID,
+		messageID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (store *MessageStore) UpdateEditedMessage(chatJID, messageID, content string, editedAt time.Time) error {
+	result, err := store.db.Exec(
+		`UPDATE messages
+		 SET content = ?, edited_at = ?
+		 WHERE chat_jid = ? AND id = ?`,
+		content,
+		editedAt.UTC().Format(time.RFC3339Nano),
+		chatJID,
+		messageID,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (store *MessageStore) DeleteMessage(chatJID, messageID string) error {
+	result, err := store.db.Exec(
+		"DELETE FROM messages WHERE chat_jid = ? AND id = ?",
+		chatJID,
+		messageID,
+	)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // Get messages from a chat
@@ -329,6 +491,152 @@ type SendMessageRequest struct {
 	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
 	ReplyToSender    string `json:"reply_to_sender,omitempty"`
 	ReplyToText      string `json:"reply_to_text,omitempty"`
+}
+
+type NativeMessageMutationRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+	Message   string `json:"message,omitempty"`
+	Emoji     string `json:"emoji,omitempty"`
+	Remove    bool   `json:"remove,omitempty"`
+}
+
+func parseMutationChatJID(value string) (types.JID, error) {
+	chatJID := strings.TrimSpace(value)
+	if chatJID == "" || !strings.Contains(chatJID, "@") {
+		return types.EmptyJID, fmt.Errorf("exact chat JID is required")
+	}
+	parsed, err := types.ParseJID(chatJID)
+	if err != nil || parsed.IsEmpty() {
+		return types.EmptyJID, fmt.Errorf("invalid chat JID")
+	}
+	return parsed, nil
+}
+
+func targetSenderJID(target messageMutationTarget) (types.JID, error) {
+	if target.IsFromMe {
+		return types.EmptyJID, nil
+	}
+	sender, err := types.ParseJID(strings.TrimSpace(target.Sender))
+	if err != nil || sender.IsEmpty() {
+		return types.EmptyJID, fmt.Errorf("message sender is unavailable")
+	}
+	return sender, nil
+}
+
+func sendWhatsAppReaction(
+	client *whatsmeow.Client,
+	messageStore *MessageStore,
+	req NativeMessageMutationRequest,
+) error {
+	if !client.IsConnected() {
+		return fmt.Errorf("not connected to WhatsApp")
+	}
+	chat, err := parseMutationChatJID(req.ChatJID)
+	if err != nil {
+		return err
+	}
+	target, err := messageStore.GetMessageMutationTarget(chat.String(), strings.TrimSpace(req.MessageID), false)
+	if err != nil {
+		return fmt.Errorf("reaction target unavailable")
+	}
+	sender, err := targetSenderJID(target)
+	if err != nil {
+		return err
+	}
+	emoji := strings.TrimSpace(req.Emoji)
+	if req.Remove {
+		emoji = whatsmeow.RemoveReactionText
+	}
+	if emoji == "" && !req.Remove {
+		return fmt.Errorf("reaction emoji is required")
+	}
+	if _, err = client.SendMessage(
+		context.Background(),
+		chat,
+		client.BuildReaction(chat, sender, types.MessageID(target.ID), emoji),
+	); err != nil {
+		return fmt.Errorf("failed to send reaction: %v", err)
+	}
+	if err = messageStore.SetMessageReaction(
+		chat.String(),
+		target.ID,
+		"me",
+		emoji,
+		true,
+	); err != nil {
+		return fmt.Errorf("reaction sent but local cache update failed")
+	}
+	return nil
+}
+
+func editWhatsAppMessage(
+	client *whatsmeow.Client,
+	messageStore *MessageStore,
+	req NativeMessageMutationRequest,
+) error {
+	if !client.IsConnected() {
+		return fmt.Errorf("not connected to WhatsApp")
+	}
+	chat, err := parseMutationChatJID(req.ChatJID)
+	if err != nil {
+		return err
+	}
+	target, err := messageStore.GetMessageMutationTarget(chat.String(), strings.TrimSpace(req.MessageID), true)
+	if err != nil {
+		return fmt.Errorf("owned edit target unavailable")
+	}
+	text := strings.TrimSpace(req.Message)
+	if text == "" {
+		return fmt.Errorf("edited message text is required")
+	}
+	if time.Since(target.Timestamp) > whatsmeow.EditWindow {
+		return fmt.Errorf("WhatsApp edit window expired")
+	}
+	if _, err = client.SendMessage(
+		context.Background(),
+		chat,
+		client.BuildEdit(
+			chat,
+			types.MessageID(target.ID),
+			&waProto.Message{Conversation: proto.String(text)},
+		),
+	); err != nil {
+		return fmt.Errorf("failed to edit message: %v", err)
+	}
+	if err = messageStore.UpdateEditedMessage(chat.String(), target.ID, text, time.Now()); err != nil {
+		return fmt.Errorf("message edited but local cache update failed")
+	}
+	return nil
+}
+
+func deleteWhatsAppMessage(
+	client *whatsmeow.Client,
+	messageStore *MessageStore,
+	req NativeMessageMutationRequest,
+) error {
+	if !client.IsConnected() {
+		return fmt.Errorf("not connected to WhatsApp")
+	}
+	chat, err := parseMutationChatJID(req.ChatJID)
+	if err != nil {
+		return err
+	}
+	target, err := messageStore.GetMessageMutationTarget(chat.String(), strings.TrimSpace(req.MessageID), true)
+	if err != nil {
+		return fmt.Errorf("owned delete target unavailable")
+	}
+	if _, err = client.SendMessage(
+		context.Background(),
+		chat,
+		client.BuildRevoke(chat, types.EmptyJID, types.MessageID(target.ID)),
+	); err != nil {
+		return fmt.Errorf("failed to delete message: %v", err)
+	}
+	if err = messageStore.DeleteMessage(chat.String(), target.ID); err != nil {
+		return fmt.Errorf("message deleted but local cache update failed")
+	}
+	return nil
 }
 
 // Function to send a WhatsApp message
@@ -538,8 +846,58 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+func handleStoredMessageMutation(messageStore *MessageStore, msg *events.Message) bool {
+	if messageStore == nil || msg == nil || msg.Message == nil {
+		return false
+	}
+	chatJID := msg.Info.Chat.String()
+	if reaction := msg.Message.GetReactionMessage(); reaction != nil {
+		targetID := strings.TrimSpace(reaction.GetKey().GetID())
+		if targetID == "" || chatJID == "" {
+			return true
+		}
+		actor := msg.Info.Sender.String()
+		if msg.Info.IsFromMe {
+			actor = "me"
+		}
+		_ = messageStore.SetMessageReaction(
+			chatJID,
+			targetID,
+			actor,
+			reaction.GetText(),
+			msg.Info.IsFromMe,
+		)
+		return true
+	}
+	if msg.IsEdit {
+		messageID := strings.TrimSpace(string(msg.Info.ID))
+		if messageID == "" || chatJID == "" {
+			return true
+		}
+		_ = messageStore.UpdateEditedMessage(
+			chatJID,
+			messageID,
+			extractTextContent(msg.Message),
+			time.Now(),
+		)
+		return true
+	}
+	protocolMessage := msg.Message.GetProtocolMessage()
+	if protocolMessage.GetType() == waProto.ProtocolMessage_REVOKE {
+		targetID := strings.TrimSpace(protocolMessage.GetKey().GetID())
+		if targetID != "" && chatJID != "" {
+			_ = messageStore.DeleteMessage(chatJID, targetID)
+		}
+		return true
+	}
+	return false
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+	if handleStoredMessageMutation(messageStore, msg) {
+		return
+	}
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.String()
@@ -773,7 +1131,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -807,6 +1165,49 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+func nativeMessageMutationHandler(
+	client *whatsmeow.Client,
+	messageStore *MessageStore,
+	operation func(*whatsmeow.Client, *MessageStore, NativeMessageMutationRequest) error,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req NativeMessageMutationRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "Invalid request format",
+			})
+			return
+		}
+		if strings.TrimSpace(req.ChatJID) == "" || strings.TrimSpace(req.MessageID) == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "Chat JID and message ID are required",
+			})
+			return
+		}
+		if err := operation(client, messageStore, req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: err.Error(),
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: true,
+			Message: "WhatsApp message operation completed",
+		})
+	}
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	http.HandleFunc("/api/capabilities", func(w http.ResponseWriter, r *http.Request) {
@@ -816,9 +1217,24 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]bool{
-			"native_replies": true,
+			"native_replies":   true,
+			"native_reactions": true,
+			"native_edits":     true,
+			"native_deletes":   true,
 		})
 	})
+	http.HandleFunc(
+		"/api/react",
+		nativeMessageMutationHandler(client, messageStore, sendWhatsAppReaction),
+	)
+	http.HandleFunc(
+		"/api/edit",
+		nativeMessageMutationHandler(client, messageStore, editWhatsAppMessage),
+	)
+	http.HandleFunc(
+		"/api/delete",
+		nativeMessageMutationHandler(client, messageStore, deleteWhatsAppMessage),
+	)
 
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
@@ -846,7 +1262,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		fmt.Println("Received request to send WhatsApp message")
 
 		// Send the message
 		success, message := sendWhatsAppMessage(
@@ -861,7 +1277,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				ChatJID:   req.Recipient,
 			},
 		)
-		fmt.Println("Message sent", success, message)
+		fmt.Println("WhatsApp send completed", success)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -954,14 +1370,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -1127,7 +1543,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -1142,7 +1558,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
