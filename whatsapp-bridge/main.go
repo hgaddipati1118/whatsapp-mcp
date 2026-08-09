@@ -68,6 +68,8 @@ type messageMutationTarget struct {
 	IsFromMe  bool
 }
 
+const maxRESTRequestBodyBytes = 1 << 20
+
 func ensureMessageReplySchema(db *sql.DB) error {
 	rows, err := db.Query("PRAGMA table_info(messages)")
 	if err != nil {
@@ -1208,9 +1210,41 @@ func nativeMessageMutationHandler(
 	}
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
+func secureRESTHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRESTRequestBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func newRESTHTTPServer(handler http.Handler, port int) *http.Server {
+	return &http.Server{
+		Addr:              fmt.Sprintf("127.0.0.1:%d", port),
+		Handler:           secureRESTHandler(handler),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+}
+
+// Start a loopback-only REST API server for local PenguinConnect access.
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	http.HandleFunc("/api/capabilities", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	})
+	mux.HandleFunc("/api/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -1223,21 +1257,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			"native_deletes":   true,
 		})
 	})
-	http.HandleFunc(
+	mux.HandleFunc(
 		"/api/react",
 		nativeMessageMutationHandler(client, messageStore, sendWhatsAppReaction),
 	)
-	http.HandleFunc(
+	mux.HandleFunc(
 		"/api/edit",
 		nativeMessageMutationHandler(client, messageStore, editWhatsAppMessage),
 	)
-	http.HandleFunc(
+	mux.HandleFunc(
 		"/api/delete",
 		nativeMessageMutationHandler(client, messageStore, deleteWhatsAppMessage),
 	)
 
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1294,7 +1328,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1345,12 +1379,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	server := newRESTHTTPServer(mux, port)
+	fmt.Printf("Starting loopback-only REST API server on %s...\n", server.Addr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
