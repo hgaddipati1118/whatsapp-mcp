@@ -1307,6 +1307,10 @@ func startPairingServer(state *pairingState, port int) *http.Server {
 	return server
 }
 
+func consolePairingQREnabled() bool {
+	return os.Getenv("WHATSAPP_PAIRING_CONSOLE_QR") == "1"
+}
+
 // Start a loopback-only REST API server for local PenguinConnect access.
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	mux := http.NewServeMux()
@@ -1553,12 +1557,16 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
+		// Keep pairing material out of ordinary logs unless a CLI user explicitly opts in.
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				pairing.update("waiting_for_scan", evt.Code)
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				if consolePairingQREnabled() {
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else {
+					fmt.Println("WhatsApp pairing is ready in the local Penguin setup window.")
+				}
 			} else if evt.Event == "success" {
 				pairing.update("connected", "")
 				connected <- true

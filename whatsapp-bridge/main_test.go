@@ -61,3 +61,14 @@ func TestPairingQRIsUnavailableBeforeCode(t *testing.T) {
 		t.Fatalf("expected 404, got %d", response.Code)
 	}
 }
+
+func TestConsolePairingQRIsOptIn(t *testing.T) {
+	t.Setenv("WHATSAPP_PAIRING_CONSOLE_QR", "")
+	if consolePairingQREnabled() {
+		t.Fatal("console pairing QR must be disabled by default")
+	}
+	t.Setenv("WHATSAPP_PAIRING_CONSOLE_QR", "1")
+	if !consolePairingQREnabled() {
+		t.Fatal("console pairing QR should require an explicit opt-in")
+	}
+}
