@@ -516,6 +516,100 @@ type SendMessageRequest struct {
 	ReplyToText      string `json:"reply_to_text,omitempty"`
 }
 
+type CreateGroupRequest struct {
+	Name         string   `json:"name"`
+	Participants []string `json:"participants"`
+}
+
+type CreateGroupResponse struct {
+	Success          bool   `json:"success"`
+	GroupJID         string `json:"group_jid,omitempty"`
+	Name             string `json:"name,omitempty"`
+	ParticipantCount int    `json:"participant_count,omitempty"`
+	Message          string `json:"message,omitempty"`
+}
+
+type createGroupFunc func(context.Context, string, []types.JID) (types.JID, error)
+
+func normalizeCreateGroupRequest(req CreateGroupRequest) (string, []types.JID, error) {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return "", nil, fmt.Errorf("group name is required")
+	}
+	if len([]rune(name)) > 25 {
+		return "", nil, fmt.Errorf("group name must be 25 characters or fewer")
+	}
+	if len(req.Participants) < 2 || len(req.Participants) > 32 {
+		return "", nil, fmt.Errorf("group requires between 2 and 32 participants")
+	}
+	participants := make([]types.JID, 0, len(req.Participants))
+	seen := make(map[string]struct{}, len(req.Participants))
+	for _, raw := range req.Participants {
+		value := strings.TrimSpace(raw)
+		var jid types.JID
+		var err error
+		if strings.Contains(value, "@") {
+			jid, err = types.ParseJID(value)
+			if err != nil || jid.IsEmpty() || (jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer) {
+				return "", nil, fmt.Errorf("each participant must be an exact WhatsApp phone number or user JID")
+			}
+			jid = jid.ToNonAD()
+		} else {
+			digits := strings.TrimPrefix(value, "+")
+			if len(digits) < 7 || len(digits) > 15 {
+				return "", nil, fmt.Errorf("each participant must be an exact WhatsApp phone number or user JID")
+			}
+			for _, character := range digits {
+				if character < '0' || character > '9' {
+					return "", nil, fmt.Errorf("each participant must be an exact WhatsApp phone number or user JID")
+				}
+			}
+			jid = types.NewJID(digits, types.DefaultUserServer)
+		}
+		key := jid.String()
+		if _, exists := seen[key]; exists {
+			return "", nil, fmt.Errorf("group participants must be unique")
+		}
+		seen[key] = struct{}{}
+		participants = append(participants, jid)
+	}
+	return name, participants, nil
+}
+
+func createGroupHandler(create createGroupFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req CreateGroupRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(CreateGroupResponse{Success: false, Message: "Invalid request format"})
+			return
+		}
+		name, participants, err := normalizeCreateGroupRequest(req)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(CreateGroupResponse{Success: false, Message: err.Error()})
+			return
+		}
+		groupJID, err := create(r.Context(), name, participants)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(CreateGroupResponse{Success: false, Message: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(CreateGroupResponse{
+			Success:          true,
+			GroupJID:         groupJID.String(),
+			Name:             name,
+			ParticipantCount: len(participants),
+		})
+	}
+}
+
 type NativeMessageMutationRequest struct {
 	ChatJID   string `json:"chat_jid"`
 	MessageID string `json:"message_id"`
@@ -1333,6 +1427,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			"native_reactions": true,
 			"native_edits":     true,
 			"native_deletes":   true,
+			"group_create":     true,
 		})
 	})
 	mux.HandleFunc(
@@ -1347,6 +1442,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		"/api/delete",
 		nativeMessageMutationHandler(client, messageStore, deleteWhatsAppMessage),
 	)
+	mux.HandleFunc("/api/groups/create", createGroupHandler(
+		func(ctx context.Context, name string, participants []types.JID) (types.JID, error) {
+			if !client.IsConnected() {
+				return types.EmptyJID, fmt.Errorf("not connected to WhatsApp")
+			}
+			group, err := client.CreateGroup(ctx, whatsmeow.ReqCreateGroup{
+				Name:         name,
+				Participants: participants,
+			})
+			if err != nil {
+				return types.EmptyJID, fmt.Errorf("failed to create WhatsApp group")
+			}
+			return group.JID, nil
+		},
+	))
 
 	// Handler for sending messages
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
