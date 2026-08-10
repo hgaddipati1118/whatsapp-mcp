@@ -14,11 +14,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
+	"rsc.io/qr"
 
 	"bytes"
 
@@ -69,6 +71,25 @@ type messageMutationTarget struct {
 }
 
 const maxRESTRequestBodyBytes = 1 << 20
+
+type pairingState struct {
+	mu     sync.RWMutex
+	status string
+	code   string
+}
+
+func (state *pairingState) update(status, code string) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.status = status
+	state.code = code
+}
+
+func (state *pairingState) snapshot() (string, string) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return state.status, state.code
+}
 
 func ensureMessageReplySchema(db *sql.DB) error {
 	rows, err := db.Query("PRAGMA table_info(messages)")
@@ -1233,6 +1254,59 @@ func newRESTHTTPServer(handler http.Handler, port int) *http.Server {
 	}
 }
 
+func newPairingHandler(state *pairingState) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	})
+	mux.HandleFunc("/pairing/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		status, code := state.snapshot()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":       status,
+			"qr_available": code != "",
+		})
+	})
+	mux.HandleFunc("/pairing/qr.png", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		_, code := state.snapshot()
+		if code == "" {
+			http.Error(w, "Pairing QR is not ready", http.StatusNotFound)
+			return
+		}
+		encoded, err := qr.Encode(code, qr.L)
+		if err != nil {
+			http.Error(w, "Could not encode pairing QR", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(encoded.PNG())
+	})
+	return secureRESTHandler(mux)
+}
+
+func startPairingServer(state *pairingState, port int) *http.Server {
+	server := newRESTHTTPServer(newPairingHandler(state), port)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("Pairing server error: %v\n", err)
+		}
+	}()
+	return server
+}
+
 // Start a loopback-only REST API server for local PenguinConnect access.
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	mux := http.NewServeMux()
@@ -1429,6 +1503,9 @@ func main() {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
 	}
+	pairing := &pairingState{status: "starting"}
+	pairingServer := startPairingServer(pairing, 8081)
+	defer pairingServer.Shutdown(context.Background())
 
 	// Initialize message store
 	messageStore, err := NewMessageStore()
@@ -1463,9 +1540,15 @@ func main() {
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
+		qrChan, qrErr := client.GetQRChannel(context.Background())
+		if qrErr != nil {
+			pairing.update("error", "")
+			logger.Errorf("Failed to prepare pairing: %v", qrErr)
+			return
+		}
 		err = client.Connect()
 		if err != nil {
+			pairing.update("error", "")
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
@@ -1473,11 +1556,17 @@ func main() {
 		// Print QR code for pairing with phone
 		for evt := range qrChan {
 			if evt.Event == "code" {
+				pairing.update("waiting_for_scan", evt.Code)
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
+				pairing.update("connected", "")
 				connected <- true
 				break
+			} else if evt.Event == "timeout" {
+				pairing.update("expired", "")
+			} else if evt.Event == "error" {
+				pairing.update("error", "")
 			}
 		}
 
@@ -1486,13 +1575,16 @@ func main() {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
 		case <-time.After(3 * time.Minute):
+			pairing.update("expired", "")
 			logger.Errorf("Timeout waiting for QR code scan")
 			return
 		}
 	} else {
 		// Already logged in, just connect
+		pairing.update("connected", "")
 		err = client.Connect()
 		if err != nil {
+			pairing.update("error", "")
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
